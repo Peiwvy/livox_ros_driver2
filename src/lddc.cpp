@@ -31,6 +31,9 @@
 #include <iomanip>
 #include <math.h>
 #include <stdint.h>
+#include <unordered_map>
+#include <set>
+#include <chrono>
 
 #include "include/ros_headers.h"
 
@@ -199,6 +202,50 @@ void Lddc::PrepareExit(void) {
 }
 
 void Lddc::PublishPointcloud2(LidarDataQueue *queue, uint8_t index) {
+  auto valid_lidar_size = [&]() -> uint8_t {
+    return std::count_if(lds_->lidars_, lds_->lidars_ + lds_->lidar_count_, 
+                          [](const auto& lidar) { return lidar.handle != 0; });
+  };
+
+  static std::unordered_map<uint8_t, PointCloud2> cloud_cache;
+  static std::unordered_map<uint8_t, uint64_t> timestamp_cache; 
+  static std::set<uint8_t> lidars_with_data; 
+  static auto lidar_valid_num = valid_lidar_size();
+
+  auto all_lidars_data_ready = [&]() -> bool {
+    using namespace std::chrono;
+
+    static auto last_check_time = high_resolution_clock::now();
+    auto current_time = high_resolution_clock::now();
+    auto time_diff = duration_cast<seconds>(current_time - last_check_time);
+
+    if (lidars_with_data.size() !=lidar_valid_num) {
+      if(time_diff.count() > 1)
+        printf("Connected lidar count does not match the configured lidar count.\n");
+      return false;
+    }
+    for (uint32_t i = 0; i <lidar_valid_num; i++) {
+      if (lidars_with_data.count(i) == 0) {
+        if(time_diff.count() > 1)
+          printf("Lidar %d did not receive data.\n", i);
+        return false;
+      }
+    }
+
+    last_check_time = current_time;
+    return true;
+  };
+
+  auto merge_point_clouds = [](PointCloud2& output,
+                            const PointCloud2& new_cloud) {
+    if (output.fields.size() != new_cloud.fields.size()) {
+      return;
+    }
+    output.data.insert(output.data.end(), new_cloud.data.begin(), new_cloud.data.end());
+    output.width += new_cloud.width;
+    output.row_step += new_cloud.row_step;
+  };
+
   while(!QueueIsEmpty(queue)) {
     StoragePacket pkg;
     QueuePop(queue, &pkg);
@@ -210,7 +257,28 @@ void Lddc::PublishPointcloud2(LidarDataQueue *queue, uint8_t index) {
     PointCloud2 cloud;
     uint64_t timestamp = 0;
     InitPointcloud2Msg(pkg, cloud, timestamp);
-    PublishPointcloud2Data(index, timestamp, cloud);
+
+    cloud_cache[index] = cloud;
+    timestamp_cache[index] = timestamp;
+    lidars_with_data.insert(index);
+
+    if (all_lidars_data_ready()) {
+      PointCloud2 merged_cloud;
+      InitPointcloud2MsgHeader(merged_cloud);
+
+      for (const auto& pair : cloud_cache) {
+        merge_point_clouds(merged_cloud, pair.second);
+      }
+
+      auto max_timestamp_iter = std::max_element(timestamp_cache.begin(), timestamp_cache.end(), 
+                                                [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+      uint64_t merged_timestamp = max_timestamp_iter->second;
+
+      PublishPointcloud2Data(index , merged_timestamp, merged_cloud);
+      cloud_cache.clear();
+      timestamp_cache.clear();
+      lidars_with_data.clear();
+    }
   }
 }
 
@@ -577,7 +645,7 @@ PublisherPtr Lddc::GetCurrentPublisher(uint8_t index) {
       DRIVER_INFO(*cur_node_, "Support multi topics.");
     } else {
       DRIVER_INFO(*cur_node_, "Support only one topic.");
-      snprintf(name_str, sizeof(name_str), "livox/lidar");
+      snprintf(name_str, sizeof(name_str), "/driver/livox/point_cloud");
     }
 
     *pub = new ros::Publisher;
